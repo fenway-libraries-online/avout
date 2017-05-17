@@ -1,0 +1,330 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use XML::LibXSLT;
+use XML::LibXML;
+use POSIX qw(strftime);
+use File::Basename qw(dirname basename);
+use Getopt::Long
+    qw(:config posix_default gnu_compat require_order bundling no_ignore_case);
+
+use constant TAB => ',';
+
+sub usage;
+sub fatal;
+sub blather;
+
+(my $prog = $0) =~ s{.+/}{};
+
+my %bitrate2quality = qw(
+    192k    high
+     28k    low
+);
+my $verbose;
+my @time = localtime;
+my $batch_name = strftime('Export from Variations %Y-%m-%d %H:%M:%S', @time);
+my $submitter;
+my $src = '/v3/dmlserv/content';
+my $dst;
+my $skip_transcoding;
+my $all;
+GetOptions(
+    'b=s' => \$batch_name,
+    'u=s' => \$submitter,
+    's=s' => \$src,
+    'd=s' => \$dst,
+    'N' => \$skip_transcoding,
+    'v' => \$verbose,
+    'a' => \$all,
+) or usage;
+usage 'Option -u SUBMITTER is required'
+    if !defined $submitter;
+fatal "invalid batch name: $batch_name"
+    if $batch_name =~ /[^-:@. 0-9A-Za-z]/;
+fatal "invalid submitter (must be an e-mail address): $submitter"
+    if $submitter !~ /^[0-9A-Za-z][-.0-9A-Za-z]*[@][0-9A-Za-z][-.0-9A-Za-z]*$/;
+
+my $xslt = XML::LibXSLT->new;
+my $stylesheet = $xslt->parse_stylesheet(XML::LibXML->load_xml('string' => xsl()));
+my %object;
+
+xchdir($src);
+$dst ||= strftime('/v3/avalon/tmp/%Y%m%dT%H%M%S', @time);
+if (!@ARGV) {
+    usage if !$all;
+    @ARGV = sort glob('access/audio/*.xml');
+}
+elsif ($all) {
+    usage "Option -a doesn't make sense when XML files are specified";
+}
+
+my @metadata;
+fatal "not an XML file: $_" for grep !/\.xml$/, @ARGV;
+xmkdir(dirname($dst), $dst, "$dst/content");
+blather sprintf "exporting %d object(s)...", scalar(@ARGV);
+foreach my $f (@ARGV) {
+    my $obj = object($f);
+    $object{$obj->{'bibid'}} = $obj;
+    copy_media_files($obj);
+}
+save_batch_metadata();
+
+my $rdy = $dst;
+if ($rdy =~ s{/tmp/}{/ready/}) {
+    xrename($dst, $rdy);
+}
+print $rdy, "\n";
+blather 'avout: done';
+
+# --- Functions
+
+sub object {
+    my ($f) = @_;
+    my $obj = parse_access_file($f);
+    find_media_files($obj);
+    extract_structure($obj);
+    return $obj;
+}
+
+sub parse_access_file {
+    my ($f) = @_;
+    $f =~ m{.*/(\d+)\.xml$} or fatal "not an XML access file: $f";
+    my $bibid = $1;
+    my $doc = XML::LibXML->load_xml('location' => $f);
+    my @media_labels = field($doc, '//OrderedMediaObjects/MO/Label');
+    my %obj = (
+        'doc' => $doc,
+        'bibid' => $bibid,
+        'access_file' => $f,
+        'media' => {
+            map { $_ => {} } @media_labels,
+        }
+    );
+    return \%obj;
+}
+
+sub find_media_files {
+    my ($obj) = @_;
+    my $doc = $obj->{'doc'};
+    while (my ($label, $media) = each %{ $obj->{'media'} }) {
+        my ($mediadoc) = $doc->findnodes(sprintf '//RecordSet/MediaObject[Label/text()="%s"]', $label);
+        my $media_id = field($mediadoc, 'Id');
+        (my $media_id_number = $media_id) =~ s{.+/}{};
+        $media->{'media_id'} = $media_id;
+        $media->{'label'} = $label;
+        $media->{'files'} = {};
+        my ($infodoc) = $mediadoc->findnodes('FileInfos/FileInfo');
+        my $size = field($infodoc, 'Size');
+        my $name = field($infodoc, 'FileName');
+        my $md5  = field($infodoc, 'Checksum');
+        my @files = glob("audio-objects/$media_id_number/*.*");
+        my %ext = map { /\.(m[po][4v])$/ ? ($1 => 1) : () } @files;
+        next if scalar(keys %ext) != 1;
+        $media->{'name'} = sprintf '%s.%s', lc $label, keys %ext;
+        foreach my $file (@files) {
+            $file =~ /\.(\d+k)\.\w+$/ or next;
+            my $bitrate = $1;
+            my $quality = $bitrate2quality{$bitrate} or next;
+            my $file_size = -s $file;
+            my $destination = $file;
+            for ($destination) {
+                s/\.$bitrate\./.$quality./;
+                s{.+/}{content/};
+            }
+            my %file = (
+                'bit_rate' => $bitrate,
+                'quality' => $quality,
+                'size' => $file_size,
+                'source' => $file,
+                'destination' => $destination,
+            );
+            $file{'checksum'} = $md5 if $file_size == $size;
+            warning('huh?'), next if $media->{'files'}{$quality};
+            $media->{'files'}{$quality} = \%file;
+        }
+    }
+}
+
+sub extract_structure {
+    my ($obj) = @_;
+    my $doc = $obj->{'doc'};
+    my %structure;
+ITEM:
+    foreach my $itemdoc ($doc->findnodes("//Container/Structure/Item")) {
+        #########################################################################
+        # BEGIN a very nasty workaround for an apparent bug in                  #
+        # XML::LibXML::Element::findnodes that causes all ContentInterval       #
+        # elements to be returned, not just those within this Item.  Or maybe I #
+        # just don't understand how to use XML::LibXML.  :-(                    #
+        #########################################################################
+        my $item = xmldoc($itemdoc->toString(1));
+        my $structure_xml = $item->toString(1);
+        my @spandocs = $item->findnodes('//ContentInterval');
+        #########################################################################
+        # END workaround                                                        #
+        #########################################################################
+        foreach my $span (@spandocs) {
+            my $media_id = $span->getAttribute('mediaRef');
+            $structure{$media_id} ||= $structure_xml;
+            blather "  media item {",
+                    "    media id = $media_id",
+                    "    tracks = " . scalar(@spandocs),
+                    "  }";
+            next ITEM;
+        }
+    }
+    while (my ($label, $media) = each %{ $obj->{'media'} }) {
+        my $media_id = $media->{'media_id'};
+        $media->{'structure'} = delete $structure{$media_id} or die;
+    }
+    die if scalar keys %structure;
+}
+
+sub copy_media_files {
+    my ($obj) = @_;
+    while (my ($label, $media) = each %{ $obj->{'media'} }) {
+        my $files = $media->{'files'};
+        foreach my $quality (qw(low medium high)) {
+            my $file = $files->{$quality} or next;
+            my $file_src = $file->{'source'};
+            my $file_dst = sprintf '%s/%s', $dst, $file->{'destination'};
+            xlink($file_src, $file_dst);
+        }
+    }
+}
+
+sub warning {
+    print STDERR 'avout: warning: ', $_, "\n" for @_;
+}
+
+sub save_batch_metadata {
+    my $fh = xopen('>', "$dst/batch_manifest.csv");
+    my $max_num_media = 0;
+    while (my ($bibid, $object) = each %object) {
+        my $media = $object->{'media'};
+        my $num_media = scalar keys %$media;
+        $max_num_media = $num_media if $num_media > $max_num_media;
+    }
+    print $fh $batch_name, TAB, $submitter, "\n";
+    print $fh join(TAB, 'Bibliographic ID', 'Bibliographic ID Label', ('File', 'Skip Transcoding') x $max_num_media), "\n";
+    foreach my $object (sort { $a->{'bibid'} <=> $b->{'bibid'} } values %object) {
+        my $bibid = $object->{'bibid'};
+        my $media = $object->{'media'};
+        print STDERR $bibid;
+        print $fh $bibid, TAB, 'local';
+        # print $fh join(TAB, $bib_id, 'local', map { ($_->{'destination'} => 'Yes') } values %$media), "\n";
+        foreach my $label (sort by_media_id keys %{ $object->{'media'} }) {
+            my $media = $object->{'media'}{$label};
+            (my $letter = lc $label) =~ s/.+-//;
+            my $name = $media->{'name'};
+            my $struc_xml = $stylesheet->transform(XML::LibXML->load_xml('string' => $media->{'structure'}))->toString(1); 
+            my $struc_dst = sprintf '%s/content/%s.structure.xml', $dst, $name;
+            print { xopen('>', $struc_dst) } $struc_xml;
+            print $fh TAB, "content/$name", TAB, 'Yes';
+            print STDERR ' ', $letter, '(';
+            foreach my $file (values %{ $media->{'files'} }) {
+                print STDERR uc substr($file->{'quality'}, 0, 1);
+            }
+            print STDERR ')';
+        }
+        print $fh "\n";
+        print STDERR "\n";
+    }
+}
+
+# --- Functions
+
+sub xrename {
+    my ($src, $dst) = @_;
+    rename($src, $dst) or fatal "rename $src $dst: $!";
+}
+
+sub xlink {
+    my ($src, $dst) = @_;
+    link($src, $dst) or fatal "link $src $dst: $!";
+}
+
+sub xopen {
+    my ($mode, $path) = @_;
+    open my $fh, $mode, $path or fatal "open $path: $!";
+    return $fh;
+}
+
+sub xmkdir {
+    foreach my $dir (@_) {
+        -d $dir or mkdir $dir or fatal "mkdir $dir: $!";
+    }
+}
+
+sub xchdir {
+    foreach my $dir (@_) {
+        chdir $dir or fatal "chdir $dir: $!";
+    }
+}
+
+sub field {
+    my ($elt, $gi) = @_;
+    my @vals = map { $_->textContent } $elt->findnodes($gi);
+    return if !@vals;
+    return @vals if wantarray;
+    return $vals[0];
+}
+
+sub xmldoc {
+    return XML::LibXML->load_xml('string' => qq{<?xml version="1.0" encoding="UTF-8"?>\n} . shift);
+}
+
+sub xsl {
+    <<'EOS';
+<?xml version="1.0" encoding="UTF-8"?>
+<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+    <xsl:output method="xml" encoding="UTF-8" indent="yes"/>
+    <!--
+    <xsl:template match="/">
+        <xsl:apply-templates/>
+    </xsl:template>
+    -->
+    <xsl:template match="/Item">
+        <Item label="{@label}">
+            <xsl:apply-templates/>
+        </Item>
+    </xsl:template>
+    <xsl:template match="Div">
+        <Div label="{@label}">
+            <xsl:apply-templates/>
+        </Div>
+    </xsl:template>
+    <xsl:template match="Chunk">
+        <Span begin="{floor(number(ContentInterval/@begin div 3600000)mod 24)}:{floor(number(ContentInterval/@begin div 60000)mod 60)}:{floor(number(ContentInterval/@begin div 1000)mod 60)}"
+              end="{floor(number(ContentInterval/@end div 3600000)mod 24)}:{floor(number(ContentInterval/@end div 60000)mod 60)}:{floor(number(ContentInterval/@end div 1000)mod 60)}"
+              label="{@label}"/>
+    </xsl:template>
+    <xsl:template match="text()"/>
+</xsl:stylesheet>
+EOS
+}
+
+sub by_media_id {
+    length($a) <=> length($b)
+    or
+    $a cmp $b
+}
+
+sub blather {
+    return if !$verbose;
+    print STDERR $_, "\n" for @_;
+}
+
+sub usage {
+    print STDERR "usage: avout -u SUBMITTER [-va] [-b NAME] [-s SRCDIR] [-d DSTDIR] XMLFILE...\n";
+    print STDERR $_, "\n" for @_;
+    exit 1;
+}
+
+sub fatal {
+    print STDERR "avout: $_\n" for @_;
+    exit 2;
+}
+
