@@ -26,10 +26,9 @@ my $verbose;
 my @time = localtime;
 my $batch_name = strftime('Export from Variations %Y-%m-%d %H:%M:%S', @time);
 my $submitter;
-my $src = '/v3/dmlserv/content';
-my $dst;
-my $skip_transcoding;
-my $all;
+my $root = glob("~dmlserv");
+my ($src, $dst, $log);
+my ($skip_transcoding, $all);
 GetOptions(
     'b=s' => \$batch_name,
     'u=s' => \$submitter,
@@ -38,6 +37,8 @@ GetOptions(
     'N' => \$skip_transcoding,
     'v' => \$verbose,
     'a' => \$all,
+    'r=s' => \$root,
+    'l=s' => \$log,
 ) or usage;
 usage 'Option -u SUBMITTER is required'
     if !defined $submitter;
@@ -46,12 +47,17 @@ fatal "invalid batch name: $batch_name"
 fatal "invalid submitter (must be an e-mail address): $submitter"
     if $submitter !~ /^[0-9A-Za-z][-.0-9A-Za-z]*[@][0-9A-Za-z][-.0-9A-Za-z]*$/;
 
+$src ||= "$root/content";
+$dst ||= strftime("$root/tmp/%Y%m%dT%H%M%S", @time);
+$log ||= "$root/avout.log";
+
+my $fhlog = xopen('>>', $log);
+
 my $xslt = XML::LibXSLT->new;
 my $stylesheet = $xslt->parse_stylesheet(XML::LibXML->load_xml('string' => xsl()));
 my %object;
 
 xchdir($src);
-$dst ||= strftime('/v3/avalon/tmp/%Y%m%dT%H%M%S', @time);
 if (!@ARGV) {
     usage if !$all;
     @ARGV = sort glob('access/audio/*.xml');
@@ -201,20 +207,20 @@ sub warning {
 
 sub save_batch_metadata {
     my $skipstr = $skip_transcoding ? 'Yes' : 'No';
-    my $fh = xopen('>', "$dst/batch_manifest.csv");
+    my $fhcsv = xopen('>', "$dst/batch_manifest.csv");
     my $max_num_media = 0;
     while (my ($bibid, $object) = each %object) {
         my $media = $object->{'media'};
         my $num_media = scalar keys %$media;
         $max_num_media = $num_media if $num_media > $max_num_media;
     }
-    print $fh $batch_name, TAB, $submitter, "\n";
-    print $fh join(TAB, 'Bibliographic ID', 'Bibliographic ID Label', ('File', 'Skip Transcoding') x $max_num_media), "\n";
+    print $fhcsv $batch_name, TAB, $submitter, "\n";
+    print $fhcsv join(TAB, 'Bibliographic ID', 'Bibliographic ID Label', ('File', 'Skip Transcoding') x $max_num_media), "\n";
     foreach my $object (sort { $a->{'bibid'} <=> $b->{'bibid'} } values %object) {
         my $bibid = $object->{'bibid'};
         my $media = $object->{'media'};
-        print STDERR $bibid;
-        print $fh $bibid, TAB, 'local';
+        print $fhlog $bibid;
+        print $fhcsv $bibid, TAB, 'local';
         foreach my $label (sort by_media_id keys %{ $object->{'media'} }) {
             my $media = $object->{'media'}{$label};
             (my $letter = lc $label) =~ s/.+-//;
@@ -222,15 +228,15 @@ sub save_batch_metadata {
             my $struc_xml = $stylesheet->transform(XML::LibXML->load_xml('string' => $media->{'structure'}))->toString(1); 
             my $struc_dst = sprintf '%s/content/%s.structure.xml', $dst, $name;
             print { xopen('>', $struc_dst) } $struc_xml;
-            print $fh TAB, "content/$name", TAB, $skipstr;
-            print STDERR ' ', $letter, '(';
+            print $fhcsv TAB, "content/$name", TAB, $skipstr;
+            print $fhlog ' ', $letter, '(';
             foreach my $file (values %{ $media->{'files'} }) {
-                print STDERR uc substr($file->{'quality'}, 0, 1);
+                print $fhlog uc substr($file->{'quality'}, 0, 1);
             }
-            print STDERR ')';
+            print $fhlog ')';
         }
-        print $fh "\n";
-        print STDERR "\n";
+        print $fhcsv "\n";
+        print $fhlog "\n";
     }
 }
 
