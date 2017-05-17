@@ -200,6 +200,7 @@ sub warning {
 }
 
 sub save_batch_metadata {
+    my $skipstr = $skip_transcoding ? 'Yes' : 'No';
     my $fh = xopen('>', "$dst/batch_manifest.csv");
     my $max_num_media = 0;
     while (my ($bibid, $object) = each %object) {
@@ -214,7 +215,6 @@ sub save_batch_metadata {
         my $media = $object->{'media'};
         print STDERR $bibid;
         print $fh $bibid, TAB, 'local';
-        # print $fh join(TAB, $bib_id, 'local', map { ($_->{'destination'} => 'Yes') } values %$media), "\n";
         foreach my $label (sort by_media_id keys %{ $object->{'media'} }) {
             my $media = $object->{'media'}{$label};
             (my $letter = lc $label) =~ s/.+-//;
@@ -222,7 +222,7 @@ sub save_batch_metadata {
             my $struc_xml = $stylesheet->transform(XML::LibXML->load_xml('string' => $media->{'structure'}))->toString(1); 
             my $struc_dst = sprintf '%s/content/%s.structure.xml', $dst, $name;
             print { xopen('>', $struc_dst) } $struc_xml;
-            print $fh TAB, "content/$name", TAB, 'Yes';
+            print $fh TAB, "content/$name", TAB, $skipstr;
             print STDERR ' ', $letter, '(';
             foreach my $file (values %{ $media->{'files'} }) {
                 print STDERR uc substr($file->{'quality'}, 0, 1);
