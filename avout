@@ -108,7 +108,7 @@ foreach my $f (@ARGV) {
     emit author => $obj->{'author'};
     emit title => $obj->{'title'};
     copy_media_files($obj);
-    blather $f, $obj->{'author'}, $obj->{'title'};
+    blather $f, "  $obj->{'author'}", "  $obj->{'title'}", '';
 }
 save_batch_metadata();
 xrename($tmp, $dst) if !$dry_run;
