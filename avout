@@ -108,11 +108,13 @@ foreach my $f (@ARGV) {
     emit author => $obj->{'author'};
     emit title => $obj->{'title'};
     copy_media_files($obj);
+    blather $f, $obj->{'author'}, $obj->{'title'};
 }
 save_batch_metadata();
 xrename($tmp, $dst) if !$dry_run;
 emit ready => $dst;
 emit end => strftime('%Y-%m-%d %H:%M:%S', localtime);
+emit;
 foreach (@delete) {
     if (!$dry_run) {
         unlink $_ or fatal "unlink $_: $!";
@@ -214,10 +216,6 @@ ITEM:
             my $media_id = $span->getAttribute('mediaRef');
             $structure{$media_id} ||= $structure_xml;
             emit object => basename($media_id);
-            #blather "| media item {",
-            #        "|   media id = $media_id",
-            #        "|   tracks = " . scalar(@spandocs),
-            #        "| }";
             next ITEM;
         }
     }
@@ -391,6 +389,7 @@ sub blather {
 }
 
 sub emit {
+    print($fhlog "\n"), return if !@_;
     my $key = shift;
     printf $fhlog "%-8s %s\n", $key, join(' ', @_);
     # print $fhlog "@_\n";
