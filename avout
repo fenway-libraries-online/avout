@@ -15,6 +15,7 @@ use constant TAB => ',';
 sub usage;
 sub fatal;
 sub blather;
+sub emit;
 
 (my $prog = $0) =~ s{.+/}{};
 
@@ -92,27 +93,28 @@ elsif ($all) {
 my @metadata;
 fatal "not an XML file: $_" for grep !/\.xml$/, @ARGV;
 xmkdir(dirname($tmp), $tmp, "$tmp/content") if !$dry_run;
-blather sprintf "* exporting %d object(s)...", scalar(@ARGV);
 my @delete;
+emit batch => $bat;
+emit begin => strftime('%Y-%m-%d %H:%M:%S', localtime);
 foreach my $f (@ARGV) {
     if (-l $f) {
         push @delete, $f;
         $f = readlink($f) or fatal "broken symlink: $f";
     }
-    blather "FILE $f";
+    emit file => $f;
     my $obj = object($f);
     $object{$obj->{'bibid'}} = $obj;
+    emit bibid => sprintf('%d', $obj->{'bibid'} + 0);
+    emit author => $obj->{'author'};
+    emit title => $obj->{'title'};
     copy_media_files($obj);
-    print $fhlog $f, "\n";
 }
 save_batch_metadata();
 xrename($tmp, $dst) if !$dry_run;
-print $dst, "\n";
+emit ready => $dst;
+emit end => strftime('%Y-%m-%d %H:%M:%S', localtime);
 foreach (@delete) {
-    if ($dry_run) {
-        blather "* unlink $_";
-    }
-    else {
+    if (!$dry_run) {
         unlink $_ or fatal "unlink $_: $!";
     }
 }
@@ -133,10 +135,14 @@ sub parse_access_file {
     my $bibid = $1;
     my $doc = XML::LibXML->load_xml('location' => $f);
     my @media_labels = field($doc, '//OrderedMediaObjects/MO/Label');
+    my $author = field($doc, '//Bibinfo/Author');
+    my $title = field($doc, '//RecordSet/Container/DisplayTitle');
     my %obj = (
         'doc' => $doc,
         'bibid' => $bibid,
         'access_file' => $f,
+        'author' => $author || '(none)',
+        'title' => $title || '(none)',
         'media' => {
             map { $_ => {} } @media_labels,
         }
@@ -207,11 +213,11 @@ ITEM:
         foreach my $span (@spandocs) {
             my $media_id = $span->getAttribute('mediaRef');
             $structure{$media_id} ||= $structure_xml;
-            blather "OBJECT " . basename($media_id);
-            blather "| media item {",
-                    "|   media id = $media_id",
-                    "|   tracks = " . scalar(@spandocs),
-                    "| }";
+            emit object => basename($media_id);
+            #blather "| media item {",
+            #        "|   media id = $media_id",
+            #        "|   tracks = " . scalar(@spandocs),
+            #        "| }";
             next ITEM;
         }
     }
@@ -230,10 +236,7 @@ sub copy_media_files {
             my $file = $files->{$quality} or next;
             my $file_src = $file->{'source'};
             my $file_dst = sprintf '%s/%s', $tmp, $file->{'destination'};
-            if ($dry_run) {
-                print STDERR "* link $file_src to $file_dst\n";
-            }
-            else {
+            if (!$dry_run) {
                 xlink($file_src, $file_dst);
             }
         }
@@ -264,24 +267,24 @@ sub save_batch_metadata {
     foreach my $object (sort { $a->{'bibid'} <=> $b->{'bibid'} } values %object) {
         my $bibid = $object->{'bibid'};
         my $media = $object->{'media'};
-        print STDERR 'MEDIA';
+        my @log_line;
         print $fhcsv $bibid, TAB, 'local';
         foreach my $label (sort by_media_id keys %{ $object->{'media'} }) {
-            print STDERR ' ', $label;
+            push @log_line, $label;
             my $media = $object->{'media'}{$label};
             my $name = $media->{'name'};
             my $struc_xml = $stylesheet->transform(XML::LibXML->load_xml('string' => $media->{'structure'}))->toString(1); 
             my $struc_dst = sprintf '%s/content/%s.structure.xml', $tmp, $name;
             print { xopen('>', $struc_dst) } $struc_xml if !$dry_run;
             print $fhcsv TAB, "content/$name", TAB, $skipstr;
-            print STDERR '(';
+            push @log_line, '(';
             foreach my $file (values %{ $media->{'files'} }) {
-                print STDERR uc substr($file->{'quality'}, 0, 1);
+                push @log_line, uc substr($file->{'quality'}, 0, 1);
             }
-            print STDERR ')';
+            push @log_line, ')';
         }
         print $fhcsv "\n";
-        print STDERR "\n";
+        emit media => @log_line;
     }
 }
 
@@ -385,6 +388,12 @@ sub by_media_id {
 sub blather {
     return if !$verbose;
     print STDERR $_, "\n" for @_;
+}
+
+sub emit {
+    my $key = shift;
+    printf $fhlog "%-8s %s\n", $key, join(' ', @_);
+    # print $fhlog "@_\n";
 }
 
 sub usage {
