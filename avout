@@ -109,7 +109,12 @@ save_batch_metadata();
 xrename($tmp, $dst) if !$dry_run;
 print $dst, "\n";
 foreach (@delete) {
-    unlink $_ or fatal "unlink $_: $!";
+    if ($dry_run) {
+        blather "* unlink $_";
+    }
+    else {
+        unlink $_ or fatal "unlink $_: $!";
+    }
 }
 
 # --- Functions
@@ -262,15 +267,14 @@ sub save_batch_metadata {
         print STDERR 'MEDIA';
         print $fhcsv $bibid, TAB, 'local';
         foreach my $label (sort by_media_id keys %{ $object->{'media'} }) {
-            blather "LABEL $label";
+            print STDERR ' ', $label;
             my $media = $object->{'media'}{$label};
-            (my $letter = lc $label) =~ s/.+-//;
             my $name = $media->{'name'};
             my $struc_xml = $stylesheet->transform(XML::LibXML->load_xml('string' => $media->{'structure'}))->toString(1); 
             my $struc_dst = sprintf '%s/content/%s.structure.xml', $tmp, $name;
             print { xopen('>', $struc_dst) } $struc_xml if !$dry_run;
             print $fhcsv TAB, "content/$name", TAB, $skipstr;
-            print STDERR " $letter(";
+            print STDERR '(';
             foreach my $file (values %{ $media->{'files'} }) {
                 print STDERR uc substr($file->{'quality'}, 0, 1);
             }
