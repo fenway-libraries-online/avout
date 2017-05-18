@@ -1,0 +1,7 @@
+avout exports audio files and associated metadata from Variations into an
+Avalon batch ingest package.
+
+The ingest package format is documented here:
+
+https://wiki.dlib.indiana.edu/display/VarVideo/Batch+Ingest+Package+Format
+
