@@ -24,35 +24,58 @@ my %bitrate2quality = qw(
 );
 my $verbose;
 my @time = localtime;
-my $batch_name = strftime('Export from Variations %Y-%m-%d %H:%M:%S', @time);
+my $description = strftime('Export from Variations %Y-%m-%d %H:%M:%S', @time);
 my $submitter;
 my $root = glob("~dmlserv");
-my ($src, $dst, $log);
-my ($skip_transcoding, $all);
+my ($cnf, $bat, $src, $acc, $tmp, $dst, $log);
+my ($skip_transcoding, $all, $dry_run);
 GetOptions(
-    'b=s' => \$batch_name,
-    'u=s' => \$submitter,
+    'b=s' => \$bat,
     's=s' => \$src,
+    'f=s' => \$acc,
     'd=s' => \$dst,
+    't=s' => \$tmp,
+    'm=s' => \$description,
+    'u=s' => \$submitter,
     'N' => \$skip_transcoding,
     'v' => \$verbose,
     'a' => \$all,
+    'n' => sub { $dry_run = $verbose = 1 },
     'r=s' => \$root,
     'l=s' => \$log,
+    'c=s' => \$cnf,
 ) or usage;
-usage 'Option -u SUBMITTER is required'
+fatal "invalid batch description $description"
+    if $description =~ /[\x00-\x1f\x80-\xff]/;
+
+if (!defined $cnf) {
+    $cnf = "$root/avout.conf" if -e "$root/avout.conf";
+    $cnf ||= '/dev/null';
+}
+read_config_file($cnf) if -e $cnf;
+
+usage 'submitter must be specified using -u EMAIL or -c CONFIGFILE'
     if !defined $submitter;
-fatal "invalid batch name: $batch_name"
-    if $batch_name =~ /[^-:@. 0-9A-Za-z]/;
 fatal "invalid submitter (must be an e-mail address): $submitter"
     if $submitter !~ /^[0-9A-Za-z][-.0-9A-Za-z]*[@][0-9A-Za-z][-.0-9A-Za-z]*$/;
 
 $src ||= "$root/content";
-$dst ||= strftime("$root/tmp/%Y%m%dT%H%M%S", @time);
+$acc ||= "$root/access/audio";
+$tmp ||= "$root/tmp";
+$dst ||= "$root/ready";
+$bat ||= strftime('%Y%m%dT%H%M%S', @time);
 $log ||= "$root/avout.log";
 
-my $fhlog = xopen('>>', $log);
+$tmp .= '/' . $bat;
+$dst .= '/' . $bat;
 
+my $fhlog;
+if ($dry_run) {
+    $fhlog = \*STDERR;
+}
+else {
+    $fhlog = xopen('>>', $log);
+}
 my $xslt = XML::LibXSLT->new;
 my $stylesheet = $xslt->parse_stylesheet(XML::LibXML->load_xml('string' => xsl()));
 my %object;
@@ -60,7 +83,7 @@ my %object;
 xchdir($src);
 if (!@ARGV) {
     usage if !$all;
-    @ARGV = sort glob('access/audio/*.xml');
+    @ARGV = sort glob("$acc/*.xml");
 }
 elsif ($all) {
     usage "Option -a doesn't make sense when XML files are specified";
@@ -68,21 +91,26 @@ elsif ($all) {
 
 my @metadata;
 fatal "not an XML file: $_" for grep !/\.xml$/, @ARGV;
-xmkdir(dirname($dst), $dst, "$dst/content");
-blather sprintf "exporting %d object(s)...", scalar(@ARGV);
+xmkdir(dirname($tmp), $tmp, "$tmp/content") if !$dry_run;
+blather sprintf "* exporting %d object(s)...", scalar(@ARGV);
+my @delete;
 foreach my $f (@ARGV) {
+    if (-l $f) {
+        push @delete, $f;
+        $f = readlink($f) or fatal "broken symlink: $f";
+    }
+    blather "FILE $f";
     my $obj = object($f);
     $object{$obj->{'bibid'}} = $obj;
     copy_media_files($obj);
+    print $fhlog $f, "\n";
 }
 save_batch_metadata();
-
-my $rdy = $dst;
-if ($rdy =~ s{/tmp/}{/ready/}) {
-    xrename($dst, $rdy);
+xrename($tmp, $dst) if !$dry_run;
+print $dst, "\n";
+foreach (@delete) {
+    unlink $_ or fatal "unlink $_: $!";
 }
-print $rdy, "\n";
-blather 'avout: done';
 
 # --- Functions
 
@@ -174,10 +202,11 @@ ITEM:
         foreach my $span (@spandocs) {
             my $media_id = $span->getAttribute('mediaRef');
             $structure{$media_id} ||= $structure_xml;
-            blather "  media item {",
-                    "    media id = $media_id",
-                    "    tracks = " . scalar(@spandocs),
-                    "  }";
+            blather "OBJECT " . basename($media_id);
+            blather "| media item {",
+                    "|   media id = $media_id",
+                    "|   tracks = " . scalar(@spandocs),
+                    "| }";
             next ITEM;
         }
     }
@@ -195,8 +224,13 @@ sub copy_media_files {
         foreach my $quality (qw(low medium high)) {
             my $file = $files->{$quality} or next;
             my $file_src = $file->{'source'};
-            my $file_dst = sprintf '%s/%s', $dst, $file->{'destination'};
-            xlink($file_src, $file_dst);
+            my $file_dst = sprintf '%s/%s', $tmp, $file->{'destination'};
+            if ($dry_run) {
+                print STDERR "* link $file_src to $file_dst\n";
+            }
+            else {
+                xlink($file_src, $file_dst);
+            }
         }
     }
 }
@@ -207,36 +241,43 @@ sub warning {
 
 sub save_batch_metadata {
     my $skipstr = $skip_transcoding ? 'Yes' : 'No';
-    my $fhcsv = xopen('>', "$dst/batch_manifest.csv");
+    my $fhcsv;
     my $max_num_media = 0;
     while (my ($bibid, $object) = each %object) {
         my $media = $object->{'media'};
         my $num_media = scalar keys %$media;
         $max_num_media = $num_media if $num_media > $max_num_media;
     }
-    print $fhcsv $batch_name, TAB, $submitter, "\n";
+    if ($dry_run) {
+        $fhcsv = xopen('>', '/dev/null');
+    }
+    else {
+        $fhcsv = xopen('>', "$tmp/batch_manifest.csv");
+    }
+    print $fhcsv $description, TAB, $submitter, "\n";
     print $fhcsv join(TAB, 'Bibliographic ID', 'Bibliographic ID Label', ('File', 'Skip Transcoding') x $max_num_media), "\n";
     foreach my $object (sort { $a->{'bibid'} <=> $b->{'bibid'} } values %object) {
         my $bibid = $object->{'bibid'};
         my $media = $object->{'media'};
-        print $fhlog $bibid;
+        print STDERR 'MEDIA';
         print $fhcsv $bibid, TAB, 'local';
         foreach my $label (sort by_media_id keys %{ $object->{'media'} }) {
+            blather "LABEL $label";
             my $media = $object->{'media'}{$label};
             (my $letter = lc $label) =~ s/.+-//;
             my $name = $media->{'name'};
             my $struc_xml = $stylesheet->transform(XML::LibXML->load_xml('string' => $media->{'structure'}))->toString(1); 
-            my $struc_dst = sprintf '%s/content/%s.structure.xml', $dst, $name;
-            print { xopen('>', $struc_dst) } $struc_xml;
+            my $struc_dst = sprintf '%s/content/%s.structure.xml', $tmp, $name;
+            print { xopen('>', $struc_dst) } $struc_xml if !$dry_run;
             print $fhcsv TAB, "content/$name", TAB, $skipstr;
-            print $fhlog ' ', $letter, '(';
+            print STDERR " $letter(";
             foreach my $file (values %{ $media->{'files'} }) {
-                print $fhlog uc substr($file->{'quality'}, 0, 1);
+                print STDERR uc substr($file->{'quality'}, 0, 1);
             }
-            print $fhlog ')';
+            print STDERR ')';
         }
         print $fhcsv "\n";
-        print $fhlog "\n";
+        print STDERR "\n";
     }
 }
 
@@ -312,6 +353,25 @@ sub xsl {
 EOS
 }
 
+sub read_config_file {
+    my ($f) = @_;
+    my $fh = xopen('<', $f);
+    while (<$fh>) {
+        next if /^\s*(?:#.*)?$/;  # Skip blank lines and comments
+        $root = glob($1), next if /^root\s*=\s*(.+)/;
+        $submitter = $1, next if /^submitter\s*=\s*(.+)/;
+        $src = $1, next if /^source\s*=\s*+(.+)/;
+        $acc = $1, next if /^access\s+directory\s*=\s*+(.+)/;
+        $tmp = $1, next if /^temporary\s+directory\s*=\s*+(.+)/;
+        $dst = $1, next if /^destination\s*=\s*+(.+)/;
+        $log = $1, next if /^log\s*=\s*(.+)/;
+        $skip_transcoding = 1, next if /^transcode\s*=\s*(no?|f(?:alse)?]|0|off)$/i;
+        $skip_transcoding = 0, next if /^transcode\s*=\s*(y(?:es)?|t(?:rue)?]|1|on)$/i;
+        chomp;
+        fatal "unrecognized config at line $. of $f: $_";
+    }
+}
+
 sub by_media_id {
     length($a) <=> length($b)
     or
@@ -324,7 +384,7 @@ sub blather {
 }
 
 sub usage {
-    print STDERR "usage: avout -u SUBMITTER [-va] [-b NAME] [-s SRCDIR] [-d DSTDIR] XMLFILE...\n";
+    print STDERR "usage: avout [-va] [-c CONFIGFILE] [-u SUBMITTER] [-b NAME] [-s SRCDIR] [-d DSTDIR] [XMLFILE...]\n";
     print STDERR $_, "\n" for @_;
     exit 1;
 }
